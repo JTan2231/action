@@ -1,10 +1,15 @@
 # Repository CI
 
+Use the [Windows procedure](#windows) to run checks and install a release in
+PowerShell.
+
+## macOS
+
 Telete runs checks on a Git commit in a private checkout. Linked Git worktrees
 share one queue. A release job installs Action for the current user after the
 checks pass.
 
-## Setup
+### Setup
 
 Install Telete 0.7.0 or later. Read `man telete` before you operate the queue.
 Make `git`, `jq`, `rsync`, `shellcheck`, `shasum`, and `rustup` available on
@@ -13,7 +18,7 @@ Make `git`, `jq`, `rsync`, `shellcheck`, `shasum`, and `rustup` available on
 
 Install the [FFmpeg tools](../docs/editing.md) before deployment.
 
-## Submit and observe
+### Submit and observe
 
 Commit changes before submission. Use a clean Git worktree. Run the commands
 from the repository root.
@@ -36,7 +41,7 @@ Use a new directory with an existing parent directory. Telete uses the new
 directory's name for the branch. Run `./ci.sh --help` for other commands and
 options.
 
-## Checks and storage
+### Checks and storage
 
 CI runs `rustfmt`, Clippy, and ShellCheck. A compiler warning or lint finding
 stops the job. CI builds a release binary with the locked Cargo dependencies.
@@ -72,7 +77,7 @@ The submission command writes the artifact directory path to standard error.
 Use `./ci.sh status JOB` to examine a job with status `failed`. Read its
 `check.log` for the error. Commit the repair. Submit the new commit.
 
-## Release and install
+### Release and install
 
 `Cargo.toml` defines the release version. Run `./ci.sh bump-version` to increase
 the patch version. Run `./ci.sh bump-version minor` to increase the minor version.
@@ -113,3 +118,32 @@ action --version
 
 Use the same `export` command in your shell profile to set `PATH` for future
 sessions.
+
+## Windows
+
+1. Install Git, PowerShell 5.1 or later, Rustup, and the x64 MSVC build tools
+   with a Windows SDK. Make Git and Rustup available on `PATH`. Use the Rust
+   toolchain in `rust-toolchain.toml`.
+2. Install [FFmpeg for Windows](https://ffmpeg.org/download.html#build-windows).
+   Use the [FFmpeg requirements](../docs/editing.md) in the editing guide.
+3. Commit changes. Open PowerShell in the repository root. Use a clean Git
+   worktree.
+4. Run `.\ci.ps1` to check the source and build a release. Record the job ID.
+
+The job runs `rustfmt` and Clippy on a copy of the commit. It builds an
+offline release for `x86_64-pc-windows-msvc` with the locked Cargo
+dependencies. The job saves the binary and its manifest under
+`%LOCALAPPDATA%\Action\ci` by default. Set `ACTION_CI_ROOT` to select a
+different absolute path outside the worktree.
+
+### Install on Windows
+
+1. Run `.\ci.ps1 deploy -From JOB` to install the binary from a successful
+   Windows check. Replace `JOB` with the job ID. Use `.\ci.ps1 release` to
+   run a new check and install its binary in one command.
+2. Add `%LOCALAPPDATA%\Action\bin` to your user `PATH`. If you set
+   `ACTION_INSTALL_DIR` before installation, add that directory instead.
+3. Open a new PowerShell session. Run `action.exe --version`.
+
+Deployment checks the saved binary against its package manifest. It installs the
+checked binary as `action.exe`.

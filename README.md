@@ -18,5 +18,11 @@ Commit the changes. Run these commands from the repository root. Replace
 ./ci.sh wait JOB
 ```
 
-Use the [release procedure](scripts/ci.md#release-and-install) to install a
-checked binary.
+Run the checks in PowerShell on Windows.
+
+```powershell
+.\ci.ps1
+```
+
+Install a checked binary with the [macOS procedure](scripts/ci.md#release-and-install)
+or the [Windows procedure](scripts/ci.md#install-on-windows).

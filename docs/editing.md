@@ -4,8 +4,9 @@ Action uses local video files with a known duration. Make clips in a project.
 Export a clip as an MP4 file. Install `ffmpeg` and `ffprobe`. Make them available
 on `PATH`. Use an FFmpeg build with the `libx264` and `aac` encoders.
 
-Read the [installation procedure](../scripts/ci.md#release-and-install) to
-install `action`. Run `action --help` for command syntax.
+Install `action` on [macOS](../scripts/ci.md#release-and-install) or
+[Windows](../scripts/ci.md#install-on-windows). Run `action --help` for command
+syntax.
 
 ## Make an edit
 
@@ -15,6 +16,8 @@ install `action`. Run `action --help` for command syntax.
 4. Show the saved clips.
 5. Export the combined clip to `final.mp4`.
 
+On macOS, run these commands in a shell.
+
 ```sh
 action --project xyz init
 intro=$(action --project xyz trim ./interview.mov 12.5..28)
@@ -22,6 +25,18 @@ edit=$(action --project xyz concatenate "$intro" ./outro.mp4)
 action --project xyz list clips
 action --project xyz export "$edit" final.mp4
 ```
+
+On Windows, run these commands in PowerShell. Use an NTFS output directory.
+
+```powershell
+action.exe --project xyz init
+$intro = action.exe --project xyz trim .\interview.mov 12.5..28
+$edit = action.exe --project xyz concatenate $intro .\outro.mp4
+action.exe --project xyz list clips
+action.exe --project xyz export $edit final.mp4
+```
+
+Put literal clip IDs in quotes in PowerShell. For example, use `'@c1'`.
 
 ## Projects and clips
 

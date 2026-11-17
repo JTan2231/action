@@ -32,6 +32,8 @@ struct Geometry {
 
 pub fn probe(path: &Path) -> Result<Source, String> {
     let file = path.display();
+    #[cfg(windows)]
+    check_media_path(path)?;
     let metadata = fs::metadata(path).map_err(|error| format!("Cannot read {file}. {error}"))?;
     if !metadata.is_file() {
         return Err(format!("{file} must be a regular file."));
@@ -309,12 +311,22 @@ fn output_path(path: &Path) -> Result<PathBuf, String> {
             parent.display()
         )
     })?;
+    #[cfg(windows)]
+    check_media_path(&directory)?;
     let output = directory.join(name);
     match output.symlink_metadata() {
         Ok(_) => Err(format!("{} already exists.", output.display())),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(output),
         Err(error) => Err(format!("Cannot open {}. {error}", output.display())),
     }
+}
+
+#[cfg(windows)]
+fn check_media_path(path: &Path) -> Result<(), String> {
+    if path.to_str().is_none() {
+        return Err(format!("Use a Unicode path for {}.", path.display()));
+    }
+    Ok(())
 }
 
 struct StagingFile {
@@ -329,16 +341,15 @@ impl StagingFile {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         let directory = parent.join(format!(".action-render-{pid}-{stamp}"));
-        let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let result = {
             use std::os::unix::fs::DirBuilderExt as _;
 
-            builder.mode(0o700);
-        }
-        builder
-            .create(&directory)
-            .map_err(|error| format!("Cannot create {}. {error}", directory.display()))?;
+            fs::DirBuilder::new().mode(0o700).create(&directory)
+        };
+        #[cfg(not(unix))]
+        let result = fs::create_dir(&directory);
+        result.map_err(|error| format!("Cannot create {}. {error}", directory.display()))?;
         let file = directory.join("render.mp4");
         Ok(Self { directory, file })
     }

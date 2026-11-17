@@ -1,8 +1,12 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -128,7 +132,7 @@ impl Project {
     }
 
     pub fn resolve(&self, input: &OsStr) -> Result<Clip, String> {
-        if input.as_bytes().starts_with(b"@") {
+        if input.as_encoded_bytes().starts_with(b"@") {
             let index = input
                 .to_str()
                 .and_then(|value| value.strip_prefix("@c"))
@@ -163,7 +167,7 @@ impl Project {
         let bytes = bytes.strip_prefix(HEADER)?;
         let mut clips = Vec::new();
         if !bytes.is_empty() {
-            // Zero bytes mark the end of each field. Unix paths can contain newlines.
+            // Zero bytes mark the end of each field, including paths with newlines.
             let mut fields = bytes.strip_suffix(b"\0")?.split(|byte| *byte == 0);
             let mut ranges = Vec::new();
             while let Some(id) = fields.next() {
@@ -176,7 +180,11 @@ impl Project {
                 }
                 let start = std::str::from_utf8(fields.next()?).ok()?.parse().ok()?;
                 let end = std::str::from_utf8(fields.next()?).ok()?.parse().ok()?;
-                let path = PathBuf::from(OsString::from_vec(fields.next()?.to_vec()));
+                let path = fields.next()?;
+                #[cfg(unix)]
+                let path = PathBuf::from(OsString::from_vec(path.to_vec()));
+                #[cfg(not(unix))]
+                let path = PathBuf::from(std::str::from_utf8(path).ok()?);
                 ranges.push(Span { path, start, end });
             }
             clips.push(Clip::new(ranges).ok()?);
@@ -187,18 +195,17 @@ impl Project {
     fn save(&self, directory: &Path) -> Result<(), String> {
         let manifest = directory.join(MANIFEST);
         let temporary = directory.join(format!("{MANIFEST}.{}.tmp", std::process::id()));
-        let file = OpenOptions::new()
-            .write(true)
+        let file = writable_project_file()
             .create_new(true)
-            .mode(0o600)
             .open(&temporary)
             .map_err(|error| file_error("create", &temporary, &error))?;
         let mut writer = BufWriter::new(file);
         let result = self
             .write_manifest(&mut writer)
             .and_then(|()| writer.flush())
-            .and_then(|()| writer.get_ref().sync_all())
-            .and_then(|()| fs::rename(&temporary, &manifest));
+            .and_then(|()| writer.get_ref().sync_all());
+        drop(writer);
+        let result = result.and_then(|()| fs::rename(&temporary, &manifest));
         if let Err(error) = result {
             let _ = fs::remove_file(temporary);
             return Err(file_error("save", &manifest, &error));
@@ -211,7 +218,17 @@ impl Project {
         for (index, clip) in self.clips.iter().enumerate() {
             for span in &clip.spans {
                 write!(writer, "{}\0{}\0{}\0", index + 1, span.start, span.end)?;
-                writer.write_all(span.path.as_os_str().as_bytes())?;
+                #[cfg(unix)]
+                let path = span.path.as_os_str().as_bytes();
+                #[cfg(not(unix))]
+                let path = span
+                    .path
+                    .to_str()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "Source path must use Unicode.")
+                    })?
+                    .as_bytes();
+                writer.write_all(path)?;
                 writer.write_all(b"\0")?;
             }
         }
@@ -219,14 +236,20 @@ impl Project {
     }
 }
 
+fn writable_project_file() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+}
+
 fn lock(directory: &Path) -> Result<File, String> {
     let path = directory.join(LOCK);
-    let file = OpenOptions::new()
+    let file = writable_project_file()
         .read(true)
-        .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
         .open(&path)
         .map_err(|error| file_error("open project lock", &path, &error))?;
     file.lock()
