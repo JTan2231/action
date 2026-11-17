@@ -1,0 +1,8 @@
+{
+  "check": {
+    "program": "scripts/ci-check.sh"
+  },
+  "deploy": {
+    "program": "scripts/ci-deploy.sh"
+  }
+}
