@@ -18,6 +18,10 @@ Make `git`, `jq`, `rsync`, `shellcheck`, `shasum`, and `rustup` available on
 
 Install the [FFmpeg tools](../docs/editing.md) before deployment.
 
+Run `cargo fetch --locked` in the repository before the first check and after
+each change to `Cargo.lock`. Use the same Cargo home as the CI job. This command
+downloads the dependencies for the offline build.
+
 ### Submit and observe
 
 Commit changes before submission. Use a clean Git worktree. Run the commands
@@ -126,9 +130,11 @@ sessions.
    toolchain in `rust-toolchain.toml`.
 2. Install [FFmpeg for Windows](https://ffmpeg.org/download.html#build-windows).
    Use the [FFmpeg requirements](../docs/editing.md) in the editing guide.
-3. Commit changes. Open PowerShell in the repository root. Use a clean Git
+3. Run `cargo fetch --locked` in the repository before the first check and after
+   each change to `Cargo.lock`. Use the same Cargo home as the CI job.
+4. Commit changes. Open PowerShell in the repository root. Use a clean Git
    worktree.
-4. Run `.\ci.ps1` to check the source and build a release. Record the job ID.
+5. Run `.\ci.ps1` to check the source and build a release. Record the job ID.
 
 The job runs `rustfmt` and Clippy on a copy of the commit. It builds an
 offline release for `x86_64-pc-windows-msvc` with the locked Cargo

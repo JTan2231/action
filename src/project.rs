@@ -346,6 +346,13 @@ impl Project {
         directory: &Path,
         edit: impl FnOnce(&Self) -> Result<Clip, String>,
     ) -> Result<usize, String> {
+        Ok(Self::append(directory, edit)?.clips.len())
+    }
+
+    pub fn append(
+        directory: &Path,
+        edit: impl FnOnce(&Self) -> Result<Clip, String>,
+    ) -> Result<Self, String> {
         let manifest = directory.join(MANIFEST);
         if !manifest
             .try_exists()
@@ -358,7 +365,7 @@ impl Project {
         let clip = edit(&project)?;
         project.clips.push(clip);
         project.save(directory)?;
-        Ok(project.clips.len())
+        Ok(project)
     }
 
     pub fn resolve(&self, input: &OsStr) -> Result<Clip, String> {
@@ -382,7 +389,10 @@ impl Project {
                 });
         }
 
-        let input = Path::new(input);
+        Self::resolve_source(Path::new(input))
+    }
+
+    pub fn resolve_source(input: &Path) -> Result<Clip, String> {
         let path =
             fs::canonicalize(input).map_err(|error| file_error("resolve source", input, &error))?;
         let source = media::probe(&path)?;

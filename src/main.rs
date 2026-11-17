@@ -1,3 +1,4 @@
+mod gui;
 mod media;
 mod project;
 
@@ -12,6 +13,7 @@ use project::{Level, Project};
 const HELP: &str = "Edit video clips with FFmpeg.
 
 Usage
+  action gui [DIRECTORY]
   action --project DIRECTORY init
   action --project DIRECTORY trim INPUT START..END
   action --project DIRECTORY concatenate INPUT INPUT [INPUT ...]
@@ -34,7 +36,15 @@ Enter gain in dB from -120 to 60. The default is 0.
 fn main() -> ExitCode {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     let arguments: Vec<_> = arguments.iter().map(AsRef::<OsStr>::as_ref).collect();
-    match run(&arguments, &mut io::stdout().lock()) {
+    let result = match arguments.as_slice() {
+        [verb, rest @ ..] if *verb == "gui" => match rest {
+            [] => gui::launch(None),
+            [directory] if !directory.is_empty() => gui::launch(Some(Path::new(directory))),
+            _ => Err(usage_error()),
+        },
+        _ => run(&arguments, &mut io::stdout().lock()),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("action: {error}");

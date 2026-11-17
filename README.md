@@ -1,11 +1,12 @@
 # Action
 
-Action edits local video from the command line. It saves trim and concatenation
-results as project clips. FFmpeg reads the source files and renders the export.
+Action edits local video in a desktop window and from the command line. It saves
+video and audio edits as project clips. FFmpeg reads the source files and renders
+the export.
 
 ## Documentation
 
-- [Editing](docs/editing.md) describes project clips, commands, and exports.
+- [Editing](docs/editing.md) describes the desktop editor, commands, and exports.
 - [Repository tooling](scripts/README.md) describes CI, releases, and installation.
 
 ## CI

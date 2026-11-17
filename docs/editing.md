@@ -2,11 +2,66 @@
 
 Action uses local video files with a known duration. Make clips in a project.
 Export a clip as an MP4 file. Install `ffmpeg` and `ffprobe`. Make them available
-on `PATH`. Use an FFmpeg build with the `libx264` and `aac` encoders.
+on `PATH`. Use an FFmpeg build with the `libx264` and `aac` encoders. To hear
+sound in the desktop preview, make `ffplay` available on `PATH`.
 
 Install `action` on [macOS](../scripts/ci.md#release-and-install) or
 [Windows](../scripts/ci.md#install-on-windows). Run `action --help` for command
 syntax.
+
+## Edit in the desktop app
+
+Run `action gui` in a desktop session. To open a project at startup, add its
+directory to the command. For example, run `action gui xyz`.
+
+1. Select **New Project** and choose a project directory. To continue an edit,
+   select **Open Project** and choose the directory that contains it. Action
+   opens the most recent saved clip. Use the clip selector to open an earlier
+   clip.
+2. Select **Add Video** and choose a source file. Repeat this step to put more
+   video after the current video. You can also drop video files on the window.
+   Use **Append Clip** to add an earlier saved clip.
+3. Drag on the timeline ruler to select a range. Select **Trim Selection**
+   to keep that range in the edit.
+4. Select **Add Audio** to put an audio file on the timeline. Enter a timeline
+   range as `START..END` in seconds. Set the start time in the audio file and
+   the level in dB. Select **Apply**.
+5. Select **Play** to review the edit. Click the timeline ruler to move the
+   playhead.
+6. Select **Save Clip** to save the edit. Action assigns a new clip ID and
+   keeps the earlier saved clips in the project.
+7. Select **Export MP4** and choose an output path. Action exports the current
+   edit. You can export before you save a clip. Use the file requirements in
+   [Export](#export).
+
+Select an audio placement to use **Edit Audio** or **Remove Audio**. Use
+**Original Level** to change the level of the original sound for a time range.
+
+When you close the window or switch clips or projects with unsaved changes,
+select **Save and Continue** or **Discard**. Select **Cancel** to continue the
+current edit.
+
+### Ask Codex about an edit
+
+Install the Codex CLI and make `codex` available on `PATH`. Run `codex login`
+if you need to sign in. Action starts a local Codex app server for chat.
+
+1. Open a project. Select **Connect to Codex** if the button shows.
+2. Select a model and reasoning effort in the chat. The initial settings
+   are `gpt-6.2-sol` and `max`.
+3. Click a video or audio block to select it. Hold Shift and click to add
+   more blocks. Drag on the timeline ruler to select a time range. To select
+   part of the current video frame, drag a box in the preview.
+4. Check the selection in the chat. Enter a message and select **Send**.
+
+Action adds the project path, current clip, playhead time, and timeline
+selection to the message. For an unsaved draft, it also adds source paths,
+ranges, and audio levels. A preview selection adds a cropped still image.
+
+Codex sends the message and its attachments to the configured model provider.
+Codex has read-only access to local files in this chat. Use the editing
+controls to apply changes to the project. Action starts a new chat when you
+switch projects.
 
 ## Make an edit
 

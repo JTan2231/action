@@ -221,7 +221,7 @@ pub fn render(clip: &Clip, output: &Path) -> Result<(), String> {
         "empty_output_stream",
     ]);
 
-    let (graph, has_audio) = filter_graph(&mut command, clip)?;
+    let (graph, has_audio) = filter_graph(&mut command, clip, RenderStreams::All)?;
     command.args(["-filter_complex", &graph]);
     apply_mp4_preset(&mut command, has_audio);
 
@@ -251,8 +251,113 @@ pub fn render(clip: &Clip, output: &Path) -> Result<(), String> {
         .map_err(|error| format!("Cannot save {}. {error}", output.display()))
 }
 
-fn filter_graph(command: &mut Command, clip: &Clip) -> Result<(String, bool), String> {
+pub fn preview_video(
+    path: &Path,
+    start: u64,
+    frame_rate: u16,
+) -> Result<(Command, [u16; 2]), String> {
+    let source = probe(path)?;
+    if start >= source.duration {
+        return Err(format!(
+            "The preview time exceeds the duration of {}.",
+            path.display()
+        ));
+    }
+    let size = preview_size(source.geometry);
+    let seek = start.saturating_sub(MICROS_PER_SECOND);
+    let lead = timestamp(start - seek);
+    let input = format!("0:{}", source.video);
+    let [width, height] = size;
+    let filters = format!(
+        "fps={frame_rate}:start_time=0,tpad=stop_mode=clone:stop_duration=1,\
+         trim=start={lead},setpts=PTS-STARTPTS,scale={width}:{height},setsar=1"
+    );
+    let mut command = preview_command();
+    command
+        .args([
+            "-filter_threads",
+            "1",
+            "-threads",
+            "2",
+            "-protocol_whitelist",
+            "file",
+            "-ss",
+            &timestamp(seek),
+            "-i",
+        ])
+        .arg(path)
+        .args([
+            "-map", &input, "-an", "-vf", &filters, "-pix_fmt", "rgb24", "-c:v", "rawvideo",
+            "-threads", "1", "-f", "rawvideo", "pipe:1",
+        ]);
+    Ok((command, size))
+}
+
+fn preview_size(geometry: Geometry) -> [u16; 2] {
+    const MAX_WIDTH: u128 = 960;
+    const MAX_HEIGHT: u128 = 540;
+    let width = (u128::from(geometry.width) * u128::from(geometry.pixel_aspect.0))
+        .div_ceil(u128::from(geometry.pixel_aspect.1));
+    let height = u128::from(geometry.height);
+    let [width, height] = if width <= MAX_WIDTH && height <= MAX_HEIGHT {
+        [width, height]
+    } else if width * MAX_HEIGHT >= height * MAX_WIDTH {
+        [MAX_WIDTH, height * MAX_WIDTH / width]
+    } else {
+        [width * MAX_HEIGHT / height, MAX_HEIGHT]
+    };
+    [
+        u16::try_from(width.max(1)).unwrap_or(960),
+        u16::try_from(height.max(1)).unwrap_or(540),
+    ]
+}
+
+pub fn preview_audio(clip: &Clip) -> Result<Option<Command>, String> {
+    let mut command = preview_command();
+    command.args(["-filter_complex_threads", "2"]);
+    let (graph, has_audio) = filter_graph(&mut command, clip, RenderStreams::Audio)?;
+    if !has_audio {
+        return Ok(None);
+    }
+    command.args([
+        "-filter_complex",
+        &graph,
+        "-map",
+        "[audio]",
+        "-vn",
+        "-c:a",
+        "pcm_s16le",
+        "-f",
+        "wav",
+        "-ar",
+        &SAMPLE_RATE.to_string(),
+        "-ac",
+        "2",
+        "pipe:1",
+    ]);
+    Ok(Some(command))
+}
+
+fn preview_command() -> Command {
+    let mut command = Command::new("ffmpeg");
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    command
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RenderStreams {
+    All,
+    Audio,
+}
+
+fn filter_graph(
+    command: &mut Command,
+    clip: &Clip,
+    streams: RenderStreams,
+) -> Result<(String, bool), String> {
     let edited = !clip.audio.is_empty() || !clip.original.is_empty();
+    let include_video = streams == RenderStreams::All;
+    let separate_audio = edited || !include_video;
     let mut sources = BTreeMap::new();
     let mut geometry = None;
     let mut filters = Vec::new();
@@ -266,7 +371,6 @@ fn filter_graph(command: &mut Command, clip: &Clip) -> Result<(String, bool), St
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => entry.insert(probe(span.path.as_path())?),
         };
-        check_video_span(span, source, &mut geometry)?;
         let next = position + (span.end - span.start);
         let duration = timestamp(next - position);
         command
@@ -280,23 +384,26 @@ fn filter_graph(command: &mut Command, clip: &Clip) -> Result<(String, bool), St
                 "-i",
             ])
             .arg(&span.path);
-        let video = source.video;
-        let (aspect_x, aspect_y) = source.geometry.pixel_aspect;
-        let timing = if edited {
-            // Use the same timeline offsets for the picture and the sound.
-            format!("settb=AVTB,setpts=PTS-STARTPTS+{position}")
-        } else {
-            "setpts=PTS-STARTPTS".to_owned()
-        };
-        filters.push(format!(
-            "[{index}:{video}]trim=end={duration},{timing},setsar={aspect_x}/{aspect_y}[v{index}]"
-        ));
-        inputs.push(format!("[v{index}]"));
-        let samples = edited.then(|| sample_at(next) - sample_at(position));
+        if include_video {
+            check_video_span(span, source, &mut geometry)?;
+            let video = source.video;
+            let (aspect_x, aspect_y) = source.geometry.pixel_aspect;
+            let timing = if edited {
+                // Use the same timeline offsets for the picture and the sound.
+                format!("settb=AVTB,setpts=PTS-STARTPTS+{position}")
+            } else {
+                "setpts=PTS-STARTPTS".to_owned()
+            };
+            filters.push(format!(
+                "[{index}:{video}]trim=end={duration},{timing},setsar={aspect_x}/{aspect_y}[v{index}]"
+            ));
+            inputs.push(format!("[v{index}]"));
+        }
+        let samples = separate_audio.then(|| sample_at(next) - sample_at(position));
         if samples != Some(0) {
             filters.push(span_audio_filter(index, source.audio, &duration, samples));
             has_original |= source.audio.is_some();
-            if edited {
+            if separate_audio {
                 sound_inputs.push(format!("[a{index}]"));
             } else {
                 inputs.push(format!("[a{index}]"));
@@ -307,16 +414,23 @@ fn filter_graph(command: &mut Command, clip: &Clip) -> Result<(String, bool), St
 
     let count = clip.spans.len();
     let has_audio = has_original || !clip.audio.is_empty();
-    if edited {
-        filters.push(format!("{}interleave=n={count}[picture]", inputs.concat()));
+    if separate_audio {
+        if include_video {
+            filters.push(format!("{}interleave=n={count}[picture]", inputs.concat()));
+        }
         let count = sound_inputs.len();
-        filters.push(format!(
-            "{}concat=n={count}:v=0:a=1,asettb=1/{SAMPLE_RATE},asetpts=N[original]",
-            sound_inputs.concat()
-        ));
-        if has_audio {
-            mix_audio(command, clip, &mut filters)?;
+        let output = if !edited && has_audio {
+            "audio"
         } else {
+            "original"
+        };
+        filters.push(format!(
+            "{}concat=n={count}:v=0:a=1,asettb=1/{SAMPLE_RATE},asetpts=N[{output}]",
+            sound_inputs.concat(),
+        ));
+        if edited && has_audio {
+            mix_audio(command, clip, &mut filters)?;
+        } else if !has_audio {
             filters.push("[original]anullsink".to_owned());
         }
     } else {
@@ -328,8 +442,10 @@ fn filter_graph(command: &mut Command, clip: &Clip) -> Result<(String, bool), St
             filters.push("[audio]anullsink".to_owned());
         }
     }
-    // H.264 with 4:2:0 chroma requires even frame dimensions.
-    filters.push("[picture]pad=ceil(iw/2)*2:ceil(ih/2)*2[video]".to_owned());
+    if include_video {
+        // H.264 with 4:2:0 chroma requires even frame dimensions.
+        filters.push("[picture]pad=ceil(iw/2)*2:ceil(ih/2)*2[video]".to_owned());
+    }
     Ok((filters.join(";"), has_audio))
 }
 
