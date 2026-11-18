@@ -7,6 +7,7 @@ use eframe::egui::{self, Button, Id, Key, Modal, ScrollArea, TextEdit};
 pub enum PathAction {
     NewProject,
     OpenProject,
+    ImportMedia,
     AddVideo,
     AddAudio,
     Export,
@@ -17,6 +18,7 @@ impl PathAction {
         match self {
             Self::NewProject => "New Project",
             Self::OpenProject => "Open Project",
+            Self::ImportMedia => "Add Media",
             Self::AddVideo => "Add Video",
             Self::AddAudio => "Add Audio",
             Self::Export => "Export MP4",
@@ -27,7 +29,7 @@ impl PathAction {
         match self {
             Self::NewProject => "Create",
             Self::OpenProject => "Open",
-            Self::AddVideo | Self::AddAudio => "Add",
+            Self::ImportMedia | Self::AddVideo | Self::AddAudio => "Add",
             Self::Export => "Export",
         }
     }
@@ -44,6 +46,12 @@ impl PathAction {
     }
 }
 
+pub enum PathSelection {
+    Canceled,
+    One(PathBuf),
+    Media(Vec<PathBuf>),
+}
+
 struct Entry {
     path: PathBuf,
     directory: bool,
@@ -54,7 +62,7 @@ pub struct PathDialog {
     directory: PathBuf,
     entries: Result<Vec<Entry>, String>,
     path_text: String,
-    selected: Option<PathBuf>,
+    selected: Vec<PathBuf>,
 }
 
 impl PathDialog {
@@ -65,18 +73,15 @@ impl PathDialog {
             directory,
             entries,
             path_text: action.default_path().to_owned(),
-            selected: None,
+            selected: Vec::new(),
         }
     }
 
-    #[expect(
-        clippy::option_option,
-        reason = "Distinguish pending, canceled, and selected paths."
-    )]
-    pub fn show(&mut self, ctx: &egui::Context) -> Option<Option<PathBuf>> {
+    pub fn show(&mut self, ctx: &egui::Context) -> Option<PathSelection> {
         let mut navigate = None;
         let mut confirm = false;
         let mut cancel = false;
+        let import = matches!(self.action, PathAction::ImportMedia);
         let modal = Modal::new(Id::unique("path-dialog")).show(ctx, |ui| {
             ui.set_width((ctx.content_rect().width() - 40.0).clamp(0.0, 480.0));
             ui.heading(self.action.title());
@@ -92,6 +97,9 @@ impl PathDialog {
             });
 
             ui.separator();
+            if import {
+                ui.label("Select files or folders. Double-click a folder to open it.");
+            }
             let height = 260.0_f32.min(ctx.content_rect().height() * 0.5);
             ScrollArea::vertical()
                 .id_salt(&self.directory)
@@ -107,30 +115,42 @@ impl PathDialog {
                     .desired_width(f32::INFINITY),
             );
             if path.changed() {
-                self.selected = None;
+                self.selected.clear();
             }
-            let has_path =
-                !self.path_text.is_empty() || matches!(self.action, PathAction::OpenProject);
+            let has_path = !self.path_text.is_empty()
+                || !self.selected.is_empty()
+                || matches!(self.action, PathAction::OpenProject);
             confirm |=
                 has_path && path.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
             ui.horizontal(|ui| {
+                let label = if import && !has_path {
+                    "Add This Folder"
+                } else {
+                    self.action.confirm()
+                };
                 confirm |= ui
-                    .add_enabled(has_path, Button::new(self.action.confirm()))
+                    .add_enabled(has_path || import, Button::new(label))
                     .clicked();
                 cancel = ui.button("Cancel").clicked();
             });
         });
 
         if cancel || modal.should_close() {
-            return Some(None);
+            return Some(PathSelection::Canceled);
         }
         if confirm && navigate.is_none() {
+            if import {
+                if self.selected.is_empty() {
+                    self.selected.push(self.directory.join(&self.path_text));
+                }
+                return Some(PathSelection::Media(std::mem::take(&mut self.selected)));
+            }
             let path = self
                 .selected
-                .clone()
+                .pop()
                 .unwrap_or_else(|| self.directory.join(&self.path_text));
             if self.action.selects_directory() || !path.is_dir() {
-                return Some(Some(path));
+                return Some(PathSelection::One(path));
             }
             navigate = Some(path);
         }
@@ -163,12 +183,28 @@ impl PathDialog {
             } else {
                 name.to_string()
             };
-            let row = ui.selectable_label(self.selected.as_ref() == Some(&entry.path), label);
+            let mut selected = self.selected.contains(&entry.path);
+            if matches!(self.action, PathAction::ImportMedia) {
+                let row = ui.checkbox(&mut selected, label);
+                if entry.directory && row.double_clicked() {
+                    *navigate = Some(entry.path.clone());
+                } else if row.changed() {
+                    self.path_text.clear();
+                    if selected {
+                        self.selected.push(entry.path.clone());
+                    } else {
+                        self.selected.retain(|path| path != &entry.path);
+                    }
+                }
+                continue;
+            }
+            let row = ui.selectable_label(selected, label);
             if row.double_clicked() && entry.directory {
                 *navigate = Some(entry.path.clone());
             } else if row.clicked() || row.double_clicked() {
                 self.path_text = name.into_owned();
-                self.selected = Some(entry.path.clone());
+                self.selected.clear();
+                self.selected.push(entry.path.clone());
                 *confirm |= row.double_clicked();
             }
         }
@@ -177,7 +213,7 @@ impl PathDialog {
     fn browse(&mut self, directory: PathBuf) {
         self.entries = read_entries(&directory, self.action);
         self.directory = directory;
-        self.selected = None;
+        self.selected.clear();
         self.action.default_path().clone_into(&mut self.path_text);
     }
 }

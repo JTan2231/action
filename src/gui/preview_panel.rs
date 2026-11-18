@@ -17,15 +17,24 @@ pub(super) struct PreviewSelection {
 }
 
 impl PreviewSelection {
-    pub fn show(&mut self, ui: &mut Ui, preview: &mut Preview, loaded: bool) -> Result<(), String> {
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        preview: &mut Preview,
+        select_region: bool,
+    ) -> Result<(), String> {
         let (area, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
         ui.painter()
             .rect_filled(area, 6, Color32::from_rgb(12, 14, 18));
         let Some(frame) = preview.frame() else {
-            let text = preview.error().unwrap_or(if loaded {
-                "Loading preview…"
-            } else {
-                "Add a video to preview it here."
+            let text = preview.error().unwrap_or_else(|| {
+                if preview.has_video() {
+                    "Loading preview…"
+                } else if preview.duration() > 0 {
+                    "Audio preview"
+                } else {
+                    "Select media or add a video to the timeline."
+                }
             });
             ui.painter().text(
                 area.center(),
@@ -45,6 +54,9 @@ impl PreviewSelection {
         let image_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         ui.painter()
             .image(frame.texture.id(), display, image_uv, Color32::WHITE);
+        if !select_region {
+            return Ok(());
+        }
         let timestamp = frame.timestamp;
         let response = ui
             .interact(

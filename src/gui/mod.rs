@@ -5,6 +5,7 @@ mod preview;
 mod preview_panel;
 mod timeline;
 
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -13,11 +14,11 @@ use std::thread;
 
 use eframe::egui::{self, Color32, Context, Id, Pos2, Response, RichText, Ui, Vec2};
 
-use crate::project::{Clip, Level, Placement, Project};
+use crate::project::{Clip, Level, MediaKind, Placement, Project};
 use crate::{media, parse_bounds, parse_gain, parse_seconds, seconds};
 
 use self::chat_panel::{ChatAction, ChatPanel};
-use self::dialog::{PathAction, PathDialog};
+use self::dialog::{PathAction, PathDialog, PathSelection};
 use self::preview::Preview;
 use self::preview_panel::PreviewSelection;
 use self::timeline::{ACCENT, Timeline, media_name};
@@ -55,6 +56,7 @@ struct Workspace {
     base: Option<usize>,
     clip: Option<Clip>,
     dirty: bool,
+    library: BTreeMap<PathBuf, MediaKind>,
 }
 
 impl Workspace {
@@ -71,13 +73,30 @@ impl Workspace {
         let project = Project::load(&directory)?;
         let base = project.clips.len().checked_sub(1);
         let clip = project.clips.last().cloned();
-        Ok(Self {
+        let mut workspace = Self {
             directory,
             project,
             base,
             clip,
             dirty: false,
-        })
+            library: BTreeMap::new(),
+        };
+        workspace.refresh_library();
+        Ok(workspace)
+    }
+
+    fn refresh_library(&mut self) {
+        self.library.clone_from(&self.project.media);
+        for clip in self.project.clips.iter().chain(&self.clip) {
+            for span in &clip.spans {
+                self.library.insert(span.path.clone(), MediaKind::Video);
+            }
+            for audio in &clip.audio {
+                self.library
+                    .entry(audio.path.clone())
+                    .or_insert(MediaKind::Audio);
+            }
+        }
     }
 
     fn label(&self) -> String {
@@ -99,10 +118,28 @@ enum JobResult {
     Opened(Workspace),
     Changed(Clip),
     Saved(Project),
+    Imported(Project),
+    Previewed(PathBuf, MediaPreview),
     Exported(PathBuf),
 }
 
 type Job = Receiver<Result<JobResult, String>>;
+
+#[derive(PartialEq, Eq)]
+enum SidebarTab {
+    Media,
+    Chat,
+}
+
+enum MediaPreview {
+    Video(Clip),
+    Audio(u64),
+}
+
+struct SourcePreview {
+    path: PathBuf,
+    timeline_position: u64,
+}
 
 struct Editor {
     workspace: Option<Workspace>,
@@ -110,6 +147,8 @@ struct Editor {
     timeline: Timeline,
     selection: PreviewSelection,
     chat: ChatPanel,
+    sidebar_tab: SidebarTab,
+    source_preview: Option<SourcePreview>,
     path_dialog: Option<PathDialog>,
     audio_dialog: Option<AudioDialog>,
     destination: Option<Destination>,
@@ -127,6 +166,8 @@ impl Editor {
             timeline: Timeline::default(),
             selection: PreviewSelection::default(),
             chat: ChatPanel::default(),
+            sidebar_tab: SidebarTab::Media,
+            source_preview: None,
             path_dialog: None,
             audio_dialog: None,
             destination: None,
@@ -150,6 +191,7 @@ impl Editor {
     }
 
     fn refresh_preview(&mut self) {
+        self.source_preview = None;
         self.preview.set_clip(
             self.workspace
                 .as_ref()
@@ -157,6 +199,37 @@ impl Editor {
         );
         self.timeline.clear();
         self.selection = PreviewSelection::default();
+    }
+
+    fn timeline_position(&self) -> u64 {
+        self.source_preview.as_ref().map_or_else(
+            || self.preview.position(),
+            |source| source.timeline_position,
+        )
+    }
+
+    fn show_timeline_preview(&mut self) {
+        if let Some(source) = self.source_preview.take() {
+            self.preview.set_clip(
+                self.workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.clip.as_ref()),
+            );
+            self.preview.seek(source.timeline_position);
+        }
+    }
+
+    fn show_source_preview(&mut self, path: PathBuf, source: MediaPreview) {
+        let timeline_position = self.timeline_position();
+        match source {
+            MediaPreview::Video(clip) => self.preview.set_clip(Some(&clip)),
+            MediaPreview::Audio(duration) => self.preview.set_audio(path.clone(), duration),
+        }
+        self.source_preview = Some(SourcePreview {
+            path,
+            timeline_position,
+        });
+        self.status("", false);
     }
 
     fn status(&mut self, text: impl Into<String>, is_error: bool) {
@@ -208,12 +281,36 @@ impl Editor {
                     workspace.project = project;
                     workspace.base = clip_id.checked_sub(1);
                     workspace.dirty = false;
+                    workspace.refresh_library();
                 }
                 self.status(format!("Saved @c{clip_id}"), false);
                 if let Some(destination) = self.destination.take() {
                     self.navigate(ctx, destination);
                 }
             }
+            Ok(JobResult::Imported(project)) => {
+                let mut added = 0;
+                if let Some(workspace) = &mut self.workspace {
+                    added = project
+                        .media
+                        .len()
+                        .saturating_sub(workspace.project.media.len());
+                    workspace.project = project;
+                    workspace.refresh_library();
+                }
+                if added == 0 {
+                    self.status("Media already in the project.", false);
+                } else {
+                    self.status(
+                        format!(
+                            "Added {added} media {}.",
+                            if added == 1 { "file" } else { "files" }
+                        ),
+                        false,
+                    );
+                }
+            }
+            Ok(JobResult::Previewed(path, source)) => self.show_source_preview(path, source),
             Ok(JobResult::Exported(path)) => {
                 self.status(format!("Exported {}", path.display()), false);
             }
@@ -225,6 +322,7 @@ impl Editor {
         if let Some(workspace) = &mut self.workspace {
             workspace.clip = Some(clip);
             workspace.dirty = true;
+            workspace.refresh_library();
         }
         self.refresh_preview();
         self.status("", false);
@@ -267,6 +365,7 @@ impl Editor {
                     workspace.clip = Some(clip.clone());
                     workspace.base = Some(index);
                     workspace.dirty = false;
+                    workspace.refresh_library();
                     self.refresh_preview();
                     self.status("", false);
                 }
@@ -303,6 +402,26 @@ impl Editor {
         });
     }
 
+    fn import_media(&mut self, ctx: &Context, paths: Vec<PathBuf>) {
+        if let Some(workspace) = &self.workspace {
+            let directory = workspace.directory.clone();
+            self.start_job(ctx, "Adding media…", move || {
+                Project::import_media(&directory, paths).map(JobResult::Imported)
+            });
+        }
+    }
+
+    fn preview_media(&mut self, ctx: &Context, path: PathBuf, kind: MediaKind) {
+        self.preview.pause();
+        self.start_job(ctx, "Opening preview…", move || {
+            let source = match kind {
+                MediaKind::Video => Project::resolve_source(&path).map(MediaPreview::Video),
+                MediaKind::Audio => media::probe_audio(&path).map(MediaPreview::Audio),
+            }?;
+            Ok(JobResult::Previewed(path, source))
+        });
+    }
+
     fn open_dialog(&mut self, action: PathAction) {
         let directory = self
             .workspace
@@ -321,6 +440,7 @@ impl Editor {
             PathAction::OpenProject => {
                 self.request_navigation(ctx, Destination::Project(path, false));
             }
+            PathAction::ImportMedia => self.import_media(ctx, vec![path]),
             PathAction::AddVideo => self.import_video(ctx, vec![path]),
             PathAction::AddAudio => self.audio_form(AudioEdit::Add(path)),
             PathAction::Export => {
@@ -337,7 +457,7 @@ impl Editor {
     fn audio_form(&mut self, edit: AudioEdit) {
         if let Some(clip) = self.clip() {
             let bounds = self.timeline.range.clone().unwrap_or_else(|| {
-                self.preview.position().min(clip.duration() - 1)..clip.duration()
+                self.timeline_position().min(clip.duration() - 1)..clip.duration()
             });
             let mut dialog = AudioDialog {
                 edit,
@@ -359,12 +479,14 @@ impl Editor {
 
     fn show_dialogs(&mut self, ctx: &Context) {
         if let Some(dialog) = &mut self.path_dialog
-            && let Some(path) = dialog.show(ctx)
+            && let Some(selection) = dialog.show(ctx)
         {
             let action = dialog.action;
             self.path_dialog = None;
-            if let Some(path) = path {
-                self.path_selected(ctx, action, path);
+            match selection {
+                PathSelection::Canceled => {}
+                PathSelection::One(path) => self.path_selected(ctx, action, path),
+                PathSelection::Media(paths) => self.import_media(ctx, paths),
             }
         }
 
@@ -553,6 +675,7 @@ impl Editor {
     fn timeline_panel(&mut self, ui: &mut Ui) {
         ui.add_enabled_ui(self.job.is_none(), |ui| self.timeline_tools(ui));
         ui.add_space(4.0);
+        let timeline_position = self.timeline_position();
         let Some(clip) = self
             .workspace
             .as_ref()
@@ -563,7 +686,8 @@ impl Editor {
             }
             return;
         };
-        if let Some(position) = self.timeline.show(ui, clip, self.preview.position()) {
+        if let Some(position) = self.timeline.show(ui, clip, timeline_position) {
+            self.show_timeline_preview();
             self.preview.pause();
             if self.preview.position() != position {
                 self.preview.seek(position);
@@ -576,10 +700,10 @@ impl Editor {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Preview").strong());
             let playing = self.preview.is_playing();
-            let duration = self.clip().map(Clip::duration);
+            let duration = self.preview.duration();
             if ui
                 .add_enabled(
-                    duration.is_some(),
+                    duration > 0,
                     egui::Button::new(if playing { "Pause" } else { "Play" }),
                 )
                 .clicked()
@@ -587,7 +711,7 @@ impl Editor {
                 self.preview.toggle_playback();
                 ui.ctx().request_repaint();
             }
-            if let Some(duration) = duration {
+            if duration > 0 {
                 ui.label(
                     RichText::new(format!(
                         "{} / {} s",
@@ -596,6 +720,9 @@ impl Editor {
                     ))
                     .monospace(),
                 );
+            }
+            if self.source_preview.is_some() && ui.button("Back to Timeline").clicked() {
+                self.show_timeline_preview();
             }
             if let Some(error) = self
                 .preview
@@ -607,12 +734,99 @@ impl Editor {
                         .truncate(),
                 )
                 .on_hover_text(error);
+            } else if let Some(source) = &self.source_preview {
+                ui.add(egui::Label::new(media_name(&source.path)).truncate())
+                    .on_hover_text(source.path.display().to_string());
             }
         });
         ui.add_space(5.0);
-        let loaded = self.clip().is_some();
-        if let Err(error) = self.selection.show(ui, &mut self.preview, loaded) {
+        if let Err(error) =
+            self.selection
+                .show(ui, &mut self.preview, self.source_preview.is_none())
+        {
             self.status(error, true);
+        }
+    }
+
+    fn sidebar(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Media, "Media");
+            ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Chat, "Chat");
+        });
+        ui.separator();
+        match self.sidebar_tab {
+            SidebarTab::Media => self.media_panel(ui),
+            SidebarTab::Chat => self.chat_panel(ui),
+        }
+    }
+
+    fn media_panel(&mut self, ui: &mut Ui) {
+        let Some(workspace) = &self.workspace else {
+            ui.label("Create or open a project to add media.");
+            return;
+        };
+        let selected = self
+            .source_preview
+            .as_ref()
+            .and_then(|source| workspace.library.get_key_value(&source.path));
+        let (mut import, mut append) = (false, false);
+        ui.add_enabled_ui(self.job.is_none(), |ui| {
+            ui.horizontal(|ui| {
+                import = ui.button("Add Media").clicked();
+                append = ui
+                    .add_enabled(
+                        selected.is_some_and(|(_, kind)| {
+                            *kind == MediaKind::Video || workspace.clip.is_some()
+                        }),
+                        egui::Button::new("Add to Timeline"),
+                    )
+                    .clicked();
+            });
+        });
+        if import {
+            self.open_dialog(PathAction::ImportMedia);
+            return;
+        }
+        if append && let Some((path, kind)) = selected {
+            let path = path.clone();
+            match kind {
+                MediaKind::Video => self.import_video(&ui.ctx().clone(), vec![path]),
+                MediaKind::Audio => {
+                    self.show_timeline_preview();
+                    self.audio_form(AudioEdit::Add(path));
+                }
+            }
+            return;
+        }
+        if workspace.library.is_empty() {
+            ui.label("No media in this project.");
+            return;
+        }
+        let mut pick = None;
+        egui::ScrollArea::vertical()
+            .id_salt("project-media")
+            .show(ui, |ui| {
+                for (path, kind) in &workspace.library {
+                    let active = selected.is_some_and(|(selected, _)| path == selected);
+                    let label = match kind {
+                        MediaKind::Video => "Video",
+                        MediaKind::Audio => "Audio",
+                    };
+                    let button =
+                        egui::Button::selectable(active, format!("{label} · {}", media_name(path)))
+                            .truncate();
+                    if ui
+                        .add_enabled(self.job.is_none(), button)
+                        .on_hover_text(path.display().to_string())
+                        .clicked()
+                        && !active
+                    {
+                        pick = Some((path.clone(), *kind));
+                    }
+                }
+            });
+        if let Some((path, kind)) = pick {
+            self.preview_media(&ui.ctx().clone(), path, kind);
         }
     }
 
@@ -651,7 +865,7 @@ impl Editor {
                 "Active clip: {}. Duration: {} s. Playhead: {} s.",
                 workspace.label(),
                 seconds(clip.duration()),
-                seconds(self.preview.position())
+                seconds(self.timeline_position())
             );
             context.push_str(&self.timeline.describe(clip, workspace.dirty));
         }
@@ -701,10 +915,10 @@ impl eframe::App for Editor {
 
     fn ui(&mut self, ui: &mut Ui, _: &mut eframe::Frame) {
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
-        egui::Panel::right("chat")
+        egui::Panel::right("sidebar")
             .default_size(350.0)
             .size_range(275.0..=525.0)
-            .show(ui, |ui| self.chat_panel(ui));
+            .show(ui, |ui| self.sidebar(ui));
         egui::Panel::bottom("timeline")
             .resizable(true)
             .default_size(240.0)

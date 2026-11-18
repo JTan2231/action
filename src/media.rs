@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::project::{Clip, Level, OriginalLevel, Span};
+use crate::project::{Clip, Level, MediaKind, OriginalLevel, Span};
 
 const MICROS_PER_SECOND: u64 = 1_000_000;
 const SAMPLE_RATE: u64 = 48_000;
@@ -33,10 +33,14 @@ struct Geometry {
 }
 
 pub fn probe(path: &Path) -> Result<Source, String> {
-    let metadata = probe_metadata(path)?;
+    let metadata = probe_metadata(path).map_err(ProbeError::message)?;
+    video_metadata(path, &metadata)
+}
+
+fn video_metadata(path: &Path, metadata: &str) -> Result<Source, String> {
     let file = path.display();
     let duration =
-        format_duration(&metadata).ok_or_else(|| format!("Cannot get the duration of {file}."))?;
+        format_duration(metadata).ok_or_else(|| format!("Cannot get the duration of {file}."))?;
     let video_line = metadata
         .lines()
         .find(|line| regular_video(line))
@@ -69,7 +73,11 @@ struct AudioSource {
 }
 
 fn probe_audio_source(path: &Path) -> Result<AudioSource, String> {
-    let metadata = probe_metadata(path)?;
+    let metadata = probe_metadata(path).map_err(ProbeError::message)?;
+    audio_metadata(path, &metadata)
+}
+
+fn audio_metadata(path: &Path, metadata: &str) -> Result<AudioSource, String> {
     let file = path.display();
     let line = metadata
         .lines()
@@ -82,7 +90,7 @@ fn probe_audio_source(path: &Path) -> Result<AudioSource, String> {
             let audio_only = !metadata.lines().any(regular_video)
                 && metadata.lines().filter(|line| is_audio(line)).count() == 1;
             if audio_only {
-                format_duration(&metadata)
+                format_duration(metadata)
             } else {
                 None
             }
@@ -95,13 +103,45 @@ fn probe_audio_source(path: &Path) -> Result<AudioSource, String> {
     })
 }
 
-fn probe_metadata(path: &Path) -> Result<String, String> {
+pub fn probe_kind(path: &Path, skip_invalid: bool) -> Result<Option<MediaKind>, String> {
+    let result = probe_metadata(path).and_then(|metadata| {
+        if metadata.lines().any(regular_video) {
+            video_metadata(path, &metadata).map(|_| MediaKind::Video)
+        } else {
+            audio_metadata(path, &metadata).map(|_| MediaKind::Audio)
+        }
+        .map_err(ProbeError::Invalid)
+    });
+    match result {
+        Ok(kind) => Ok(Some(kind)),
+        Err(ProbeError::Invalid(_)) if skip_invalid => Ok(None),
+        Err(error) => Err(error.message()),
+    }
+}
+
+enum ProbeError {
+    Invalid(String),
+    Unavailable(String),
+}
+
+impl ProbeError {
+    fn message(self) -> String {
+        match self {
+            Self::Invalid(message) | Self::Unavailable(message) => message,
+        }
+    }
+}
+
+fn probe_metadata(path: &Path) -> Result<String, ProbeError> {
     let file = path.display();
     #[cfg(windows)]
-    check_media_path(path)?;
-    let metadata = fs::metadata(path).map_err(|error| format!("Cannot read {file}. {error}"))?;
+    check_media_path(path).map_err(ProbeError::Invalid)?;
+    let metadata = fs::metadata(path)
+        .map_err(|error| ProbeError::Invalid(format!("Cannot read {file}. {error}")))?;
     if !metadata.is_file() {
-        return Err(format!("{file} must be a regular file."));
+        return Err(ProbeError::Invalid(format!(
+            "{file} must be a regular file."
+        )));
     }
 
     let output = Command::new("ffprobe")
@@ -119,13 +159,13 @@ fn probe_metadata(path: &Path) -> Result<String, String> {
         .arg(path)
         .stdin(Stdio::null())
         .output()
-        .map_err(|error| format!("Cannot start ffprobe. {error}"))?;
+        .map_err(|error| ProbeError::Unavailable(format!("Cannot start ffprobe. {error}")))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
+        return Err(ProbeError::Invalid(format!(
             "Cannot read media in {file}. {}",
             detail.trim_end()
-        ));
+        )));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -319,11 +359,37 @@ pub fn preview_audio(clip: &Clip) -> Result<Option<Command>, String> {
     if !has_audio {
         return Ok(None);
     }
+    command.args(["-filter_complex", &graph, "-map", "[audio]"]);
+    preview_wav(&mut command);
+    Ok(Some(command))
+}
+
+pub fn preview_audio_file(path: &Path, start: u64) -> Result<Command, String> {
+    let source = probe_audio_source(path)?;
+    if start >= source.duration {
+        return Err(format!(
+            "The preview time exceeds the duration of {}.",
+            path.display()
+        ));
+    }
+    let mut command = preview_command();
+    let input = format!("0:{}", source.index);
+    command
+        .args([
+            "-protocol_whitelist",
+            "file",
+            "-ss",
+            &timestamp(start),
+            "-i",
+        ])
+        .arg(path)
+        .args(["-map", &input, "-t", &timestamp(source.duration - start)]);
+    preview_wav(&mut command);
+    Ok(command)
+}
+
+fn preview_wav(command: &mut Command) {
     command.args([
-        "-filter_complex",
-        &graph,
-        "-map",
-        "[audio]",
         "-vn",
         "-c:a",
         "pcm_s16le",
@@ -335,7 +401,6 @@ pub fn preview_audio(clip: &Clip) -> Result<Option<Command>, String> {
         "2",
         "pipe:1",
     ]);
-    Ok(Some(command))
 }
 
 fn preview_command() -> Command {

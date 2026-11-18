@@ -65,7 +65,7 @@ fn pixel_bounds(min: f32, max: f32, extent: u16) -> Result<(u16, u16), String> {
 }
 
 pub struct Preview {
-    clip: Option<Clip>,
+    source: Option<Source>,
     position: u64,
     revision: u64,
     playback: Playback,
@@ -73,10 +73,16 @@ pub struct Preview {
     requested_frame: Option<u64>,
     video_error: Option<String>,
     audio_warning: Option<String>,
-    video_requests: Sender<VideoRequest>,
+    video_requests: Sender<Option<VideoRequest>>,
     video_updates: Receiver<VideoUpdate>,
     audio_requests: Sender<AudioRequest>,
     audio_updates: Receiver<AudioUpdate>,
+}
+
+#[derive(Clone)]
+enum Source {
+    Clip(Clip),
+    Audio { path: PathBuf, duration: u64 },
 }
 
 enum Playback {
@@ -99,7 +105,7 @@ impl Preview {
         let (audio_output, audio_updates) = mpsc::channel();
         thread::spawn(move || prepare_audio(&audio_input, &audio_output));
         Self {
-            clip: None,
+            source: None,
             position: 0,
             revision: 0,
             playback: Playback::Paused,
@@ -115,7 +121,12 @@ impl Preview {
     }
 
     pub fn set_clip(&mut self, clip: Option<&Clip>) {
-        self.clip = clip.cloned();
+        self.source = clip.cloned().map(Source::Clip);
+        self.seek(0);
+    }
+
+    pub fn set_audio(&mut self, path: PathBuf, duration: u64) {
+        self.source = Some(Source::Audio { path, duration });
         self.seek(0);
     }
 
@@ -127,6 +138,9 @@ impl Preview {
         self.requested_frame = None;
         self.video_error = None;
         self.audio_warning = None;
+        if !self.has_video() {
+            let _ = self.video_requests.send(None);
+        }
     }
 
     pub fn pause(&mut self) {
@@ -143,7 +157,7 @@ impl Preview {
     pub fn toggle_playback(&mut self) {
         if self.is_playing() {
             self.pause();
-        } else if self.clip.is_some() {
+        } else if self.source.is_some() {
             if self.position == self.duration() {
                 self.seek(0);
             }
@@ -201,12 +215,20 @@ impl Preview {
         self.request_frame(context);
     }
 
-    fn duration(&self) -> u64 {
-        self.clip.as_ref().map_or(0, Clip::duration)
+    pub const fn duration(&self) -> u64 {
+        match &self.source {
+            Some(Source::Clip(clip)) => clip.duration(),
+            Some(Source::Audio { duration, .. }) => *duration,
+            None => 0,
+        }
+    }
+
+    pub const fn has_video(&self) -> bool {
+        matches!(self.source, Some(Source::Clip(_)))
     }
 
     fn request_frame(&mut self, context: &egui::Context) {
-        let Some(clip) = &self.clip else {
+        let Some(Source::Clip(clip)) = &self.source else {
             return;
         };
         let target = self.position.min(clip.duration() - 1);
@@ -220,14 +242,14 @@ impl Preview {
                     self.requested_frame = Some(timestamp);
                     if self
                         .video_requests
-                        .send(VideoRequest {
+                        .send(Some(VideoRequest {
                             context: context.clone(),
                             revision: self.revision,
                             timestamp,
                             path: span.path.clone(),
                             start: span.start,
                             number,
-                        })
+                        }))
                         .is_err()
                     {
                         self.video_error = Some("The preview decoder stopped.".to_owned());
@@ -241,12 +263,12 @@ impl Preview {
 
     fn poll_audio(&mut self, context: &egui::Context) {
         if matches!(self.playback, Playback::Starting)
-            && let Some(clip) = &self.clip
+            && let Some(source) = &self.source
         {
             let request = AudioRequest {
                 context: context.clone(),
                 revision: self.revision,
-                clip: clip.clone(),
+                source: source.clone(),
                 start: self.position,
             };
             if self.audio_requests.send(request).is_ok() {
@@ -265,6 +287,7 @@ impl Preview {
             self.start_playback(audio);
         }
         let duration = self.duration();
+        let has_video = self.has_video();
         if let Playback::Playing {
             since,
             start,
@@ -273,15 +296,15 @@ impl Preview {
         {
             let elapsed = u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX);
             self.position = start.saturating_add(elapsed).min(duration);
-            if self.position == duration {
+            if let Some(running) = audio
+                && let Some(warning) = running.error(duration - self.position)
+            {
+                self.audio_warning = Some(warning);
+                *audio = None;
+            }
+            if self.position == duration || (!has_video && audio.is_none()) {
                 self.playback = Playback::Paused;
             } else {
-                if let Some(running) = audio
-                    && let Some(warning) = running.error(duration - self.position)
-                {
-                    self.audio_warning = Some(warning);
-                    *audio = None;
-                }
                 context.request_repaint_after(Duration::from_millis(16));
             }
         }
@@ -292,6 +315,10 @@ impl Preview {
             Ok(audio) => audio,
             Err(error) => {
                 self.audio_warning = Some(error);
+                if !self.has_video() {
+                    self.playback = Playback::Paused;
+                    return;
+                }
                 None
             }
         };
@@ -323,10 +350,13 @@ struct RawFrame {
     rgb: Vec<u8>,
 }
 
-fn decode_video(input: &Receiver<VideoRequest>, output: &Sender<VideoUpdate>) {
+fn decode_video(input: &Receiver<Option<VideoRequest>>, output: &Sender<VideoUpdate>) {
     let mut decoder = None;
     while let Ok(request) = input.recv() {
-        let request = input.try_iter().last().unwrap_or(request);
+        let Some(request) = input.try_iter().last().unwrap_or(request) else {
+            decoder = None;
+            continue;
+        };
         let result = read_frame(&mut decoder, &request);
         if result.is_err() {
             decoder = None;
@@ -423,7 +453,7 @@ impl Decoder {
 struct AudioRequest {
     context: egui::Context,
     revision: u64,
-    clip: Clip,
+    source: Source,
     start: u64,
 }
 
@@ -435,11 +465,14 @@ struct AudioUpdate {
 fn prepare_audio(input: &Receiver<AudioRequest>, output: &Sender<AudioUpdate>) {
     while let Ok(request) = input.recv() {
         let request = input.try_iter().last().unwrap_or(request);
-        let duration = request.clip.duration();
-        let result = request
-            .clip
-            .trim(request.start..duration)
-            .and_then(|clip| media::preview_audio(&clip));
+        let result = match request.source {
+            Source::Clip(clip) => {
+                let duration = clip.duration();
+                clip.trim(request.start..duration)
+                    .and_then(|clip| media::preview_audio(&clip))
+            }
+            Source::Audio { path, .. } => media::preview_audio_file(&path, request.start).map(Some),
+        };
         if output
             .send(AudioUpdate {
                 revision: request.revision,

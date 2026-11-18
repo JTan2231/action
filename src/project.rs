@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::ffi::OsStr;
 #[cfg(unix)]
 use std::ffi::OsString;
@@ -16,9 +16,16 @@ use std::str::FromStr;
 use crate::{media, seconds};
 
 const MANIFEST: &str = ".action-project";
-const HEADER: &[u8] = b"action-project 2\0";
+const MEDIA_HEADER: &[u8] = b"action-project 3\0";
+const CLIP_HEADER: &[u8] = b"action-project 2\0";
 const LEGACY_HEADER: &[u8] = b"action-project 1\0";
 const LOCK: &str = ".action.lock";
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum MediaKind {
+    Video,
+    Audio,
+}
 
 #[derive(Clone)]
 pub struct Span {
@@ -308,8 +315,10 @@ fn next_placement_id(max_id: u64) -> Result<u64, String> {
         .ok_or_else(|| "Cannot assign an audio placement ID.".to_owned())
 }
 
+#[derive(Default)]
 pub struct Project {
     pub clips: Vec<Clip>,
+    pub media: BTreeMap<PathBuf, MediaKind>,
 }
 
 impl Project {
@@ -323,7 +332,7 @@ impl Project {
                 directory.display()
             )),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Self { clips: Vec::new() }.save(directory)
+                Self::default().save(directory)
             }
             Err(error) => Err(file_error("inspect", &manifest, &error)),
         }
@@ -368,6 +377,34 @@ impl Project {
         Ok(project)
     }
 
+    pub fn import_media(directory: &Path, paths: Vec<PathBuf>) -> Result<Self, String> {
+        let mut imported = BTreeMap::new();
+        for path in paths {
+            let path = directory.join(path);
+            if path.is_dir() {
+                for child in folder_files(&path)? {
+                    import_file(&child, true, &mut imported)?;
+                }
+            } else {
+                import_file(&path, false, &mut imported)?;
+            }
+        }
+        if imported.is_empty() {
+            return Err("The selection contains no supported video or audio files.".to_owned());
+        }
+
+        let _lock = lock(directory)?;
+        let mut project = Self::load(directory)?;
+        if imported
+            .iter()
+            .any(|(path, kind)| project.media.get(path) != Some(kind))
+        {
+            project.media.extend(imported);
+            project.save(directory)?;
+        }
+        Ok(project)
+    }
+
     pub fn resolve(&self, input: &OsStr) -> Result<Clip, String> {
         if input.as_encoded_bytes().starts_with(b"@") {
             let index = input
@@ -404,23 +441,45 @@ impl Project {
     }
 
     fn decode(bytes: &[u8]) -> Option<Self> {
-        let (bytes, typed) = if let Some(bytes) = bytes.strip_prefix(HEADER) {
-            (bytes, true)
+        let (bytes, version) = if let Some(bytes) = bytes.strip_prefix(MEDIA_HEADER) {
+            (bytes, 3)
+        } else if let Some(bytes) = bytes.strip_prefix(CLIP_HEADER) {
+            (bytes, 2)
         } else {
-            (bytes.strip_prefix(LEGACY_HEADER)?, false)
+            (bytes.strip_prefix(LEGACY_HEADER)?, 1)
         };
-        let mut clips = Vec::new();
+        let mut project = Self::default();
         if !bytes.is_empty() {
             // Zero bytes mark the end of each field, including paths with newlines.
             let mut fields = bytes
                 .strip_suffix(b"\0")?
                 .split(|byte| *byte == 0)
                 .peekable();
-            while fields.peek().is_some() {
-                clips.push(decode_clip(&mut fields, clips.len() + 1, typed)?);
+            while let Some(field) = fields.peek() {
+                if version == 3 && *field == b"media" {
+                    break;
+                }
+                let id = project.clips.len() + 1;
+                project
+                    .clips
+                    .push(decode_clip(&mut fields, id, version >= 2)?);
+            }
+            while let Some(tag) = fields.next() {
+                if tag != b"media" {
+                    return None;
+                }
+                let kind = match fields.next()? {
+                    b"v" => MediaKind::Video,
+                    b"a" => MediaKind::Audio,
+                    _ => return None,
+                };
+                let path = decode_path(fields.next()?)?;
+                if project.media.insert(path, kind).is_some() {
+                    return None;
+                }
             }
         }
-        Some(Self { clips })
+        Some(project)
     }
 
     fn save(&self, directory: &Path) -> Result<(), String> {
@@ -445,7 +504,11 @@ impl Project {
     }
 
     fn write_manifest(&self, writer: &mut impl Write) -> io::Result<()> {
-        writer.write_all(HEADER)?;
+        writer.write_all(if self.media.is_empty() {
+            CLIP_HEADER
+        } else {
+            MEDIA_HEADER
+        })?;
         for (index, clip) in self.clips.iter().enumerate() {
             let id = index + 1;
             for span in &clip.spans {
@@ -472,8 +535,46 @@ impl Project {
                 }
             }
         }
+        for (path, kind) in &self.media {
+            writer.write_all(match kind {
+                MediaKind::Video => b"media\0v\0",
+                MediaKind::Audio => b"media\0a\0",
+            })?;
+            write_path(writer, path)?;
+        }
         Ok(())
     }
+}
+
+fn folder_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = fs::read_dir(directory).map_err(|error| file_error("read", directory, &error))?;
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| file_error("read", directory, &error))?
+            .path();
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+    files.sort_unstable();
+    Ok(files)
+}
+
+fn import_file(
+    path: &Path,
+    skip_invalid: bool,
+    imported: &mut BTreeMap<PathBuf, MediaKind>,
+) -> Result<(), String> {
+    let path = path
+        .canonicalize()
+        .map_err(|error| file_error("resolve source", path, &error))?;
+    if let Entry::Vacant(entry) = imported.entry(path)
+        && let Some(kind) = media::probe_kind(entry.key(), skip_invalid)?
+    {
+        entry.insert(kind);
+    }
+    Ok(())
 }
 
 fn decode_clip<'a>(

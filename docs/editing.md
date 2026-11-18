@@ -41,12 +41,28 @@ When you close the window or switch clips or projects with unsaved changes,
 select **Save and Continue** or **Discard**. Select **Cancel** to continue the
 current edit.
 
+### Add and preview project media
+
+1. Open a project and select the **Media** tab.
+2. Select **Add Media**. Check the boxes for the files or folders to add. To
+   browse a folder, double-click its name. Select **Add** for checked items or
+   **Add This Folder** to add media from the open folder.
+3. Select a video or audio file in the list. Use **Play** and **Pause** to
+   preview the file. Select **Back to Timeline** to return to the edit.
+4. Select **Add to Timeline** to append the selected video. To place the
+   selected audio, first add a video to the timeline.
+
+Action adds supported video and audio files directly inside each selected
+folder. It skips subfolders and other files. The project keeps paths to the
+source files. Use **Save Clip** to save timeline changes.
+
 ### Ask Codex about an edit
 
 Install the Codex CLI and make `codex` available on `PATH`. Run `codex login`
 if you need to sign in. Action starts a local Codex app server for chat.
 
-1. Open a project. Select **Connect to Codex** if the button shows.
+1. Open a project and select the **Chat** tab. Select **Connect to Codex** if
+   the button shows.
 2. Select a model and reasoning effort in the chat. The initial settings
    are `gpt-6.2-sol` and `max`.
 3. Click a video or audio block to select it. Hold Shift and click to add
@@ -129,9 +145,9 @@ current working directory. `init` creates a project in a new or existing
 directory. An existing project causes `init` to exit with an error.
 
 The `.action-project` manifest stores clip IDs, source ranges, audio edits,
-and absolute paths to source files. Action uses `.action.lock` to let one edit
-save changes at a time. Commands that read the project can use the last saved
-manifest.
+and absolute paths to source files. It also stores the paths to files that you
+add to the media list. Action uses `.action.lock` to let one edit save changes
+at a time. Commands that read the project can use the last saved manifest.
 
 Keep the source contents and paths fixed until you complete the export.
 
